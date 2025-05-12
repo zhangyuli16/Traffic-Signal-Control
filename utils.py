@@ -109,8 +109,12 @@ class Trainer():
         self.n_step = self.model.n_step
         self.summary_writer = summary_writer
         self.run_test = run_test
-        self.is_ippo = env.agent == 'ippo'  
-        self.is_sppo = env.agent == 'sppo'  # Added SPPO flag
+        
+        # Clearly define agent type flags
+        self.is_ippo = self.agent == 'ippo'  
+        self.is_sppo = self.agent == 'sppo'  
+        self.is_iql = self.agent in ['iqld', 'iqll']
+        
         assert self.env.T % self.n_step == 0
         self.data = []
         self.output_path = output_path
@@ -187,12 +191,23 @@ class Trainer():
         Returns:
         has_spillback: Boolean value indicating whether spillback exists
         """
-        # Get road occupancy rate between the two nodes
-        occupancy = self._get_road_occupancy(node_name, neighbor_name)
-        
-        # Determine if spillback exists
-        # Consider spillback when occupancy exceeds 90%
-        return occupancy > 0.9
+        try:
+            # Get road occupancy rate between the two nodes
+            occupancy = self._get_road_occupancy(node_name, neighbor_name)
+            
+            # Determine if spillback exists
+            # Consider spillback when occupancy exceeds 90%
+            spillback = occupancy > 0.9
+            
+            if spillback:
+                logging.debug("Spillback detected between {} and {}: {:.2f}".format(
+                    node_name, neighbor_name, occupancy))
+            
+            return spillback
+        except Exception as e:
+            logging.warning("Error detecting spillback between {} and {}: {}".format(
+                node_name, neighbor_name, str(e)))
+            return False  # Default to no spillback when error occurs
     
     def _get_neighbors_info_from_sumo(self, obs):
         """Directly get neighbor node information from SUMO for spillback detection
@@ -208,7 +223,7 @@ class Trainer():
         for i, ob in enumerate(obs):
             agent_neighbors = {}
             
-            # Get node name (assume node ID is nt1, nt2, etc.)
+            # Get node name (assuming node ID is nt1, nt2, etc.)
             node_name = "nt{:d}".format(i+1)
             
             # Get neighbors of current node
@@ -234,6 +249,12 @@ class Trainer():
                                 'has_spillback': False,
                                 'state': np.zeros_like(obs[neighbor_idx])
                             }
+                    elif neighbor_idx >= 0:  # Valid index but outside obs range
+                        # Handle boundary case
+                        agent_neighbors[neighbor_idx] = {
+                            'has_spillback': False,
+                            'state': np.zeros(self.model.policy_ls[i].orig_n_s)
+                        }
             
             neighbors_info.append(agent_neighbors)
         
@@ -244,7 +265,8 @@ class Trainer():
         done = prev_done
         rewards = []
         for _ in range(self.n_step):
-            if self.agent.endswith('a2c') or self.is_ippo or self.is_sppo:  # Include SPPO in condition
+            # Forward propagation to get actions and values
+            if self.agent.endswith('a2c') or self.is_ippo or self.is_sppo:
                 if self.is_ippo:
                     # IPPO requires additional log probabilities
                     policy, value, log_probs = self.model.forward(ob, done, 'pvlogp')
@@ -266,32 +288,34 @@ class Trainer():
                     for pi in policy:
                         action.append(np.random.choice(np.arange(len(pi)), p=pi))
             else:
+                # Offline policy methods like IQL use a different forward method
                 action, policy = self.model.forward(ob, mode='explore')
             
+            # Execute environment step
             next_ob, reward, done, global_reward = self.env.step(action)
             rewards.append(global_reward)
             global_step = self.global_counter.next()
             self.cur_step += 1
             
-            # Call appropriate add_transition method based on model type
-            if self.agent.endswith('a2c'):
-                if not self.is_ippo and not self.is_sppo:
-                    self.model.add_transition(ob, action, reward, value, done)
-                elif self.is_ippo:
-                    # IPPO requires additional log probability parameter
-                    log_prob = []
-                    for a, logp in zip(action, log_probs):
-                        log_prob.append(logp[a])
-                    self.model.add_transition(ob, action, reward, value, log_prob, done)
-                elif self.is_sppo:
-                    # SPPO requires additional log probability and spillback information
-                    log_prob = []
-                    for a, logp in zip(action, log_probs):
-                        log_prob.append(logp[a])
-                    self.model.add_transition(ob, action, reward, value, log_prob, done, spillbacks)
-            else:
-                # IQL-type models use different parameter list
+            # Store transition to buffer - this needs to be fixed
+            if self.agent == 'iqld' or self.agent == 'iqll':
+                # IQL-type models add_transition
                 self.model.add_transition(ob, action, reward, next_ob, done)
+            elif self.agent.endswith('a2c'):
+                # Standard A2C model
+                self.model.add_transition(ob, action, reward, value, done)
+            elif self.is_ippo:
+                # IPPO requires additional log probability parameter
+                log_prob = []
+                for a, logp in zip(action, log_probs):
+                    log_prob.append(logp[a])
+                self.model.add_transition(ob, action, reward, value, log_prob, done)
+            elif self.is_sppo:
+                # SPPO requires additional log probability and spillback information
+                log_prob = []
+                for a, logp in zip(action, log_probs):
+                    log_prob.append(logp[a])
+                self.model.add_transition(ob, action, reward, value, log_prob, done, spillbacks)
             
             # Logging
             if self.global_counter.should_log():
@@ -306,7 +330,7 @@ class Trainer():
             ob = next_ob
         
         # Calculate return R based on model type
-        if self.agent.endswith('a2c') or self.is_ippo or self.is_sppo:  # Include SPPO in condition
+        if self.agent.endswith('a2c') or self.is_ippo or self.is_sppo:
             if done:
                 R = 0 if self.agent == 'a2c' else [0] * self.model.n_agent
             else:
@@ -388,7 +412,7 @@ class Trainer():
         return mean_reward, std_reward
 
     def run(self):
-        """Main training loop."""
+        """Main training loop"""
         while not self.global_counter.should_stop():
             # Testing
             if self.run_test and self.global_counter.should_test():
@@ -419,18 +443,28 @@ class Trainer():
             self.cur_step = 0
             rewards = []
             while True:
+                # Call the explore method to collect experience
                 ob, done, R, cur_rewards = self.explore(ob, done)
                 rewards += cur_rewards
                 global_step = self.global_counter.cur_step
-                if self.agent.endswith('a2c') or self.is_ippo or self.is_sppo:  # Modified to include SPPO
+                
+                # Call the correct backward method based on agent type
+                if self.agent.endswith('a2c') or self.is_ippo or self.is_sppo:
+                    # On-policy methods use return value R
                     self.model.backward(R, self.summary_writer, global_step)
-                else:
+                elif self.agent == 'iqld' or self.agent == 'iqll':
+                    # Off-policy methods don't need R
                     self.model.backward(self.summary_writer, global_step)
+                else:
+                    # Handle any other agent types
+                    logging.warning("Unknown agent type: {}".format(self.agent))
+                
                 # Termination condition
                 if done:
                     self.env.terminate()
                     break
             
+            # Record and summarize rewards
             rewards = np.array(rewards)
             mean_reward = np.mean(rewards)
             std_reward = np.std(rewards)
@@ -442,9 +476,27 @@ class Trainer():
             self.data.append(log)
             self._add_summary(mean_reward, global_step)
             self.summary_writer.flush()
+            
+            # Log training progress
+            logging.info('Training: global step %d, episode reward: %.2f' % 
+                        (global_step, mean_reward))
+            
+            # Check if we've reached the maximum steps
+            if self.global_counter.should_stop():
+                logging.info('Training: reached max steps %d' % global_step)
+                break
         
+        # Save training data
         df = pd.DataFrame(self.data)
         df.to_csv(self.output_path + 'train_reward.csv')
+        
+        # Save final model
+        if hasattr(self.model, 'save'):
+            model_path = self.output_path.replace('data', 'model')
+            self.model.save(model_path, global_step)
+            logging.info('Training: saved final model at step %d' % global_step)
+        
+        logging.info('Training completed successfully')
 
 
 class Tester(Trainer):

@@ -472,13 +472,22 @@ class IQL(A2C):
         return
 
     def add_transition(self, obs, actions, rewards, next_obs, done):
+        """Ensure parameter list matches the call site
+        
+        Parameters:
+        obs: Current state observations
+        actions: Actions taken
+        rewards: Rewards received
+        next_obs: Next states
+        done: Terminal flag
+        """
         if (self.reward_norm):
             rewards = rewards / self.reward_norm
         if self.reward_clip:
             rewards = np.clip(rewards, -self.reward_clip, self.reward_clip)
         for i in range(self.n_agent):
             self.trans_buffer_ls[i].add_transition(obs[i], actions[i],
-                                                   rewards[i], next_obs[i], done)
+                                                  rewards[i], next_obs[i], done)
                                                    
                                                    
                                                    
@@ -547,13 +556,23 @@ class SPPO(IA2C):
             self.trans_buffer_ls.append(SPPOBuffer(gamma, self.n_step))
 
     def add_transition(self, obs, actions, rewards, values, log_probs, done, spillbacks=None):
-        """æ·»å è½¬æ¢å°ç¼å²åºï¼åæ¬æº¢åºä¿¡æ¯"""
+        """Add a transition with spillback information
+        
+        Parameters:
+        obs: Current state observations
+        actions: Actions taken
+        rewards: Rewards received
+        values: Value estimates
+        log_probs: Log probabilities of actions
+        done: Terminal flag
+        spillbacks: Spillback detection information (optional)
+        """
         if (self.reward_norm):
             rewards = rewards / self.reward_norm
         if self.reward_clip:
             rewards = np.clip(rewards, -self.reward_clip, self.reward_clip)
         
-        # å¦ææ²¡ææä¾æº¢åºä¿¡æ¯ï¼åå»ºä¸ä¸ªå¨é¶æ°ç»
+        # If no spillbacks are provided, create default zero arrays
         if spillbacks is None:
             spillbacks = [np.zeros(len(self.policy_ls[i].neighbor_indices)) for i in range(self.n_agent)]
             
